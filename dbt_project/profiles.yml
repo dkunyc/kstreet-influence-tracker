@@ -1,0 +1,8 @@
+kstreet:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: '../data/kstreet.duckdb'
+      schema: main
+      threads: 4

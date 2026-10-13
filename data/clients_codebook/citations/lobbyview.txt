@@ -1,0 +1,3 @@
+When using this data, please cite it as follows:
+
+Kim, In Song (2018). “LobbyView: Firm-level Lobbying & Congressional Bills Database.” Working paper available from http://web.mit.edu/insong/www/pdf/lobbyview.pdf

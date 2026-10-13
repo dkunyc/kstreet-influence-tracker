@@ -1,0 +1,44 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: main
+    tables:
+      - name: raw_lobbyview_clients
+        columns:
+          - name: client_name
+            tests:
+              - not_null
+      - name: raw_lobbyview_reports
+      - name: raw_lobbyview_bills
+      - name: raw_lobbyview_issues
+      - name: raw_lobbyview_issue_text
+      - name: raw_lobbyview_network
+      - name: raw_bills
+        columns:
+          - name: bill_number
+            tests:
+              - not_null
+      - name: raw_medsl_house
+        columns:
+          - name: year
+            tests:
+              - not_null
+          - name: state_po
+            tests:
+              - not_null
+      - name: raw_filings
+        columns:
+          - name: filing_uuid
+            tests:
+              - unique
+              - not_null
+        description: "Raw LDA filings from Senate API"
+      - name: raw_bill_sponsors
+        columns:
+          - name: bioguide_id
+            tests:
+              - not_null
+
+
+
