@@ -12,6 +12,7 @@ Usage:
 import os
 import time
 from pathlib import Path
+from requests.exceptions import Timeout, ConnectionError
 
 import duckdb
 import requests
@@ -30,6 +31,23 @@ def get_session() -> requests.Session:
     s = requests.Session()
     return s
 
+def get_with_retries(session, url, params=None, max_retries=4):
+    for attempt in range(max_retries):
+        try:
+            resp = session.get(url, params=params, timeout=60)
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = 2 ** attempt
+                print(f"  Retry {attempt + 1}/{max_retries} after {wait}s (HTTP {resp.status_code})")
+                time.sleep(wait)
+                continue
+            return resp
+        except (Timeout, ConnectionError) as e:
+            wait = 2 ** attempt
+            print(f"  Retry {attempt + 1}/{max_retries} after {wait}s ({type(e).__name__})")
+            time.sleep(wait)
+    return None
 
 def fetch_sponsors_for_matched_bills():
     if not DB_PATH.exists():
@@ -43,7 +61,6 @@ def fetch_sponsors_for_matched_bills():
         SELECT DISTINCT congress, bill_type, bill_number
         FROM raw_bills
         WHERE congress = 118
-        LIMIT 300
     """).fetchall()
 
     if not matched:
@@ -73,10 +90,14 @@ def fetch_sponsors_for_matched_bills():
     for congress, btype, number in matched:
         url = f"{API_BASE}/bill/{congress}/{btype.lower()}/{number}"
         params = {"api_key": API_KEY, "format": "json"}
+
+        resp = get_with_retries(session, url, params=params)
+        if resp is None or resp.status_code != 200:
+            print(f"  Skipping {congress}/{btype}/{number} (failed or non-200)")
+            time.sleep(0.15)
+            continue
+
         try:
-            resp = session.get(url, params=params, timeout=30)
-            if resp.status_code != 200:
-                continue
             data = resp.json().get("bill", {})
             sponsors = data.get("sponsors", [])
             for s in sponsors:
@@ -95,7 +116,8 @@ def fetch_sponsors_for_matched_bills():
                 ])
                 loaded += 1
         except Exception as e:
-            print(f"  Error on {congress}/{btype}/{number}: {e}")
+            print(f"  Parse error on {congress}/{btype}/{number}: {e}")
+
         time.sleep(0.15)
 
     print(f"Loaded {loaded} sponsor records")

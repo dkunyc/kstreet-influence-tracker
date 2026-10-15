@@ -24,6 +24,13 @@ con = duckdb.connect(str(DB_PATH), read_only=True)
 def q(sql: str) -> pd.DataFrame:
     return con.execute(sql).df()
 
+def fmt_spend(df: pd.DataFrame) -> pd.DataFrame:
+    """Format spend columns with $ and commas."""
+    out = df.copy()
+    for col in out.columns:
+        if "spend" in col.lower():
+            out[col] = out[col].apply(lambda x: f"${x:,.0f}" if pd.notnull(x) else "")
+    return out
 
 @st.cache_data
 def get_years():
@@ -32,8 +39,19 @@ def get_years():
 
 @st.cache_data
 def get_issue_codes():
-    return q("SELECT DISTINCT issue_code FROM main_marts.mart_filing_bills WHERE issue_code IS NOT NULL ORDER BY 1")["issue_code"].tolist()
-
+    return q("""
+        SELECT
+            i.issue_code,
+            coalesce(d.issue_description, i.issue_code) as issue_label
+        FROM (
+            SELECT DISTINCT issue_code
+            FROM main_marts.mart_filing_bills
+            WHERE issue_code IS NOT NULL
+        ) i
+        LEFT JOIN main_staging.stg_issue_codes d
+            ON i.issue_code = d.issue_code
+        ORDER BY 2
+    """)
 
 @st.cache_data
 def get_members():
@@ -66,8 +84,12 @@ with tab1:
         years = get_years()
         selected_years = st.multiselect("Year", years, default=years[:2] if years else [])
     with col2:
-        issues = get_issue_codes()
-        selected_issues = st.multiselect("Issue code", issues)
+        issues_df = get_issue_codes()
+        issue_options = issues_df["issue_label"].tolist()
+        selected_labels = st.multiselect("Issue", issue_options)
+        selected_issues = issues_df.loc[
+            issues_df["issue_label"].isin(selected_labels), "issue_code"
+        ].tolist()
 
     year_filter = ""
     if selected_years:
@@ -84,7 +106,7 @@ with tab1:
         top_clients = q(f"""
             SELECT
                 client_name,
-                SUM(year_spend) as total_spend,
+                MAX(year_spend) as annual_spend,
                 COUNT(DISTINCT filing_uuid) as filings,
                 COUNT(DISTINCT bill_ref_normalized) as bills_mentioned
             FROM main_marts.mart_filing_bills
@@ -93,7 +115,7 @@ with tab1:
             ORDER BY 2 DESC NULLS LAST
             LIMIT 20
         """)
-        st.dataframe(top_clients, use_container_width=True)
+        st.dataframe(fmt_spend(top_clients), use_container_width=True)
     except Exception as e:
         st.info(f"Could not load top clients: {e}")
 
@@ -106,36 +128,17 @@ with tab1:
                 district,
                 chamber,
                 COUNT(DISTINCT filing_uuid) as filings,
-                COUNT(DISTINCT client_name) as clients,
-                SUM(year_spend) as total_spend
+                COUNT(DISTINCT client_name) as clients
             FROM main_marts.mart_filing_sponsor_district
             WHERE 1=1 {year_filter}
             GROUP BY 1, 2, 3, 4
             ORDER BY 5 DESC
             LIMIT 20
         """)
-        st.dataframe(top_members, use_container_width=True)
+        st.dataframe(fmt_spend(top_members), use_container_width=True)
     except Exception as e:
         st.info(f"Could not load targeted members: {e}")
 
-    st.subheader("Spend Over Time")
-    try:
-        spend_time = q(f"""
-            SELECT
-                filing_year,
-                SUM(year_spend) as total_spend,
-                COUNT(DISTINCT client_name) as clients,
-                COUNT(DISTINCT filing_uuid) as filings
-            FROM main_marts.mart_filing_bills
-            WHERE 1=1 {year_filter} {issue_filter}
-            GROUP BY 1
-            ORDER BY 1
-        """)
-        if not spend_time.empty:
-            st.line_chart(spend_time.set_index("filing_year")[["total_spend"]])
-            st.dataframe(spend_time, use_container_width=True)
-    except Exception as e:
-        st.info(f"Could not load spend over time: {e}")
 
 # ===================== TAB 2: Member Profile =====================
 with tab2:
@@ -156,14 +159,22 @@ with tab2:
             try:
                 bills = q(f"""
                     SELECT
-                        bill_title,
-                        bill_ref_normalized,
-                        COUNT(DISTINCT client_name) as clients,
-                        SUM(year_spend) as total_spend
-                    FROM main_marts.mart_filing_sponsor_district
-                    WHERE sponsor_name = '{selected_member.replace("'", "''")}'
-                    GROUP BY 1, 2
-                    ORDER BY 4 DESC NULLS LAST
+                        s.bill_title,
+                        s.bill_ref_normalized,
+                        coalesce(d.issue_description, b.issue_code) as issue,
+                        s.sponsor_party,
+                        s.competitiveness,
+                        s.two_party_margin,
+                        COUNT(DISTINCT s.client_name) as clients
+                    FROM main_marts.mart_filing_sponsor_district s
+                    LEFT JOIN main_marts.mart_filing_bills b
+                        ON s.bill_ref_normalized = b.bill_ref_normalized
+                       AND s.filing_uuid = b.filing_uuid
+                    LEFT JOIN main_staging.stg_issue_codes d
+                        ON b.issue_code = d.issue_code
+                    WHERE s.sponsor_name = '{selected_member.replace("'", "''")}'
+                    GROUP BY 1, 2, 3, 4, 5, 6
+                    ORDER BY 7 DESC
                     LIMIT 25
                 """)
                 st.dataframe(bills, use_container_width=True)
@@ -176,14 +187,14 @@ with tab2:
                     SELECT
                         client_name,
                         COUNT(DISTINCT filing_uuid) as filings,
-                        SUM(year_spend) as total_spend
+                        MAX(year_spend) as annual_spend
                     FROM main_marts.mart_filing_sponsor_district
                     WHERE sponsor_name = '{selected_member.replace("'", "''")}'
                     GROUP BY 1
                     ORDER BY 3 DESC NULLS LAST
                     LIMIT 15
                 """)
-                st.dataframe(clients, use_container_width=True)
+                st.dataframe(fmt_spend(clients), use_container_width=True)
             except Exception as e:
                 st.info(f"Could not load clients: {e}")
 
@@ -216,24 +227,59 @@ with tab3:
     if not clients:
         st.info("No client data available.")
     else:
-        selected_client = st.selectbox("Select client", clients)
+        client_search = st.text_input("Filter clients", "")
+        if client_search:
+            filtered = [c for c in clients if client_search.upper() in c.upper()]
+        else:
+            filtered = clients
 
-        if selected_client:
-            st.subheader("Spend Over Time")
+        if not filtered:
+            st.info("No clients match.")
+            selected_clients = []
+        else:
+            selected_clients = st.multiselect("Select client(s)", filtered)
+
+        if selected_clients:
+            client_list = ",".join(
+                f"'{c.replace(chr(39), chr(39)+chr(39))}'" for c in selected_clients
+            )
+            client_filter = f"AND client_name IN ({client_list})"
+
+            st.subheader("Spend by Client")
             try:
-                spend = q(f"""
+                spend_df = q(f"""
+                    WITH filing_spend AS (
+                        SELECT
+                            filing_uuid,
+                            COALESCE(income, 0) + COALESCE(expenses, 0) as spend
+                        FROM raw_filings
+                    ),
+                    client_filings AS (
+                        SELECT DISTINCT
+                            i.client_name,
+                            i.filing_uuid
+                        FROM main_marts.mart_filing_bills i
+                        WHERE i.client_name IN ({client_list})
+                    )
                     SELECT
-                        filing_year,
-                        SUM(total_spend) as total_spend,
-                        SUM(filing_count) as filings
-                    FROM main_marts.mart_influence
-                    WHERE client_name = '{selected_client.replace("'", "''")}'
-                    GROUP BY 1
-                    ORDER BY 1
+                        cf.client_name,
+                        COUNT(DISTINCT cf.filing_uuid) as filings,
+                        SUM(fs.spend) as total_spend
+                    FROM client_filings cf
+                    LEFT JOIN filing_spend fs ON cf.filing_uuid = fs.filing_uuid
+                    GROUP BY cf.client_name
+                    ORDER BY 3 DESC NULLS LAST
                 """)
-                if not spend.empty:
-                    st.line_chart(spend.set_index("filing_year")[["total_spend"]])
-                    st.dataframe(spend, use_container_width=True)
+                if not spend_df.empty:
+                    total = pd.DataFrame([{
+                        "client_name": "TOTAL",
+                        "filings": spend_df["filings"].sum(),
+                        "total_spend": spend_df["total_spend"].sum()
+                    }])
+                    display = pd.concat([spend_df, total], ignore_index=True)
+                    st.dataframe(fmt_spend(display), use_container_width=True)
+                else:
+                    st.info("No spend data for selected clients.")
             except Exception as e:
                 st.info(f"Could not load spend: {e}")
 
@@ -241,12 +287,14 @@ with tab3:
             try:
                 issues_df = q(f"""
                     SELECT
-                        issue_code,
-                        COUNT(DISTINCT filing_uuid) as filings,
-                        COUNT(DISTINCT bill_ref_normalized) as bills
-                    FROM main_marts.mart_filing_bills
-                    WHERE client_name = '{selected_client.replace("'", "''")}'
-                      AND issue_code IS NOT NULL
+                        coalesce(d.issue_description, i.issue_code) as issue,
+                        COUNT(DISTINCT i.filing_uuid) as filings,
+                        COUNT(DISTINCT i.bill_ref_normalized) as bills
+                    FROM main_marts.mart_filing_bills i
+                    LEFT JOIN main_staging.stg_issue_codes d
+                        ON i.issue_code = d.issue_code
+                    WHERE 1=1 {client_filter}
+                      AND i.issue_code IS NOT NULL
                     GROUP BY 1
                     ORDER BY 2 DESC
                     LIMIT 15
@@ -259,17 +307,24 @@ with tab3:
             try:
                 bills = q(f"""
                     SELECT
-                        bill_ref_normalized,
-                        bill_title,
-                        COUNT(*) as mentions,
-                        MAX(year_spend) as year_spend
-                    FROM main_marts.mart_filing_bills
-                    WHERE client_name = '{selected_client.replace("'", "''")}'
-                    GROUP BY 1, 2
-                    ORDER BY 3 DESC
+                        b.bill_ref_normalized,
+                        b.bill_title,
+                        coalesce(d.issue_description, b.issue_code) as issue,
+                        s.sponsor_name,
+                        s.sponsor_party,
+                        s.competitiveness,
+                        COUNT(*) as mentions
+                    FROM main_marts.mart_filing_bills b
+                    LEFT JOIN main_staging.stg_issue_codes d
+                        ON b.issue_code = d.issue_code
+                    LEFT JOIN main_marts.mart_filing_sponsor_district s
+                        ON b.bill_ref_normalized = s.bill_ref_normalized
+                    WHERE 1=1 AND b.client_name IN ({client_list})
+                    GROUP BY 1, 2, 3, 4, 5, 6
+                    ORDER BY 7 DESC
                     LIMIT 20
                 """)
-                st.dataframe(bills, use_container_width=True)
+                st.dataframe(fmt_spend(bills), use_container_width=True)
             except Exception as e:
                 st.info(f"Could not load bills: {e}")
 
@@ -283,7 +338,7 @@ with tab3:
                         chamber,
                         COUNT(DISTINCT filing_uuid) as filings
                     FROM main_marts.mart_filing_sponsor_district
-                    WHERE client_name = '{selected_client.replace("'", "''")}'
+                    WHERE 1=1 {client_filter}
                     GROUP BY 1, 2, 3, 4
                     ORDER BY 5 DESC
                     LIMIT 15
